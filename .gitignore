@@ -1,0 +1,15 @@
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+outputs/
+vendor/
+Pixal3D/
+Pixal3D/tmp/
+Pixal3D/autotune_cache.json
+*.glb
+.hf_cache/
+.cache/
+*.egg-info/
+.DS_Store
+*.log
