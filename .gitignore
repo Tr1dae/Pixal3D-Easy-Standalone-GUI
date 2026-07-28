@@ -4,6 +4,7 @@ __pycache__/
 .pytest_cache/
 outputs/
 vendor/
+models/
 Pixal3D/
 Pixal3D/tmp/
 Pixal3D/autotune_cache.json

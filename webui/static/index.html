@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Pixal3D</title>
-  <link rel="stylesheet" href="/static/styles.css?v=4" />
+  <link rel="stylesheet" href="/static/styles.css?v=6" />
   <script type="module" src="https://ajax.googleapis.com/ajax/libs/model-viewer/4.0.0/model-viewer.min.js"></script>
 </head>
 <body>
@@ -97,6 +97,8 @@
 
       <section class="panel right">
         <div class="viewer-wrap">
+          <div id="wipBadge" class="wip-badge hidden" aria-live="polite">WIP</div>
+          <button type="button" id="shadingBtn" class="viewer-tool" title="Cycle shading: PBR → Flat → Wireframe">PBR</button>
           <model-viewer
             id="viewer"
             camera-controls
@@ -106,7 +108,7 @@
             environment-image="neutral"
             alt="Generated 3D model"
           >
-            <div slot="poster" class="poster">3D preview appears here when generation finishes</div>
+            <div slot="poster" class="poster">Live WIP previews appear here during generation</div>
           </model-viewer>
           <a id="downloadLink" class="download hidden" href="#" download="pixal3d.glb">Download GLB</a>
         </div>
@@ -118,6 +120,6 @@
       </section>
     </main>
   </div>
-  <script src="/static/app.js?v=3"></script>
+  <script src="/static/app.js?v=7"></script>
 </body>
 </html>

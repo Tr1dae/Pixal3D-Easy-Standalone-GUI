@@ -4,6 +4,7 @@ Local Pixal3D web UI — FastAPI wrapper around Pixal3D/inference.py.
 from __future__ import annotations
 
 import asyncio
+import gc
 import json
 import math
 import os
@@ -26,6 +27,11 @@ ROOT = Path(__file__).resolve().parent.parent
 PIXAL_ROOT = ROOT / "Pixal3D"
 OUTPUTS = ROOT / "outputs"
 STATIC = Path(__file__).resolve().parent / "static"
+
+# Cap input before rembg / MoGe so huge uploads cannot inflate VRAM.
+# 1024² pixels + max side 1024 matches upstream preprocess intent.
+MAX_INPUT_PIXELS = int(os.environ.get("PIXAL3D_MAX_INPUT_PIXELS", str(1024 * 1024)))
+MAX_INPUT_SIDE = int(os.environ.get("PIXAL3D_MAX_INPUT_SIDE", "1024"))
 
 sys.path.insert(0, str(PIXAL_ROOT))
 
@@ -117,6 +123,9 @@ def _job_update(job_id: str, **kwargs: Any) -> None:
                 "stage": "queued",
                 "logs": [],
                 "glb_url": None,
+                "preview_url": None,
+                "preview_label": None,
+                "preview_history": [],
                 "error": None,
             },
         )
@@ -180,6 +189,135 @@ def _as_bool(value: str | bool) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _flush_cuda(job_id: Optional[str] = None, label: str = "CUDA cache flushed") -> None:
+    """Release orphaned tensors and return unused cached blocks to the driver."""
+    gc.collect()
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+            try:
+                torch.cuda.ipc_collect()
+            except Exception:
+                pass
+            try:
+                torch.cuda.reset_peak_memory_stats()
+            except Exception:
+                pass
+    except Exception:
+        pass
+    gc.collect()
+    if job_id:
+        _log(job_id, label, with_vram=True)
+
+
+def _clamp_input_image(img, max_pixels: int = MAX_INPUT_PIXELS, max_side: int = MAX_INPUT_SIDE):
+    """Downscale keeping aspect ratio so w*h <= max_pixels and max(w,h) <= max_side."""
+    from PIL import Image
+
+    if img.mode not in ("RGB", "RGBA"):
+        img = img.convert("RGBA" if "A" in (img.mode or "") else "RGB")
+    w, h = img.size
+    if w <= 0 or h <= 0:
+        return img
+    scale = 1.0
+    pixels = w * h
+    if pixels > max_pixels:
+        scale = min(scale, math.sqrt(max_pixels / float(pixels)))
+    long_side = max(w, h) * scale
+    if long_side > max_side:
+        scale = min(scale, max_side / float(max(w, h)))
+    if scale >= 0.999:
+        return img
+    nw = max(1, int(round(w * scale)))
+    nh = max(1, int(round(h * scale)))
+    return img.resize((nw, nh), Image.Resampling.LANCZOS)
+
+
+def _emit_wip_preview(
+    job_id: str,
+    out_path: Path,
+    label: str,
+    *,
+    progress: Optional[int] = None,
+    stage: Optional[str] = None,
+    detail: str = "",
+) -> None:
+    """Publish a WIP GLB URL; append to history so the UI can dwell on each stage."""
+    rel = out_path.relative_to(OUTPUTS).as_posix()
+    bust = uuid.uuid4().hex[:8]
+    url = f"/outputs/{rel}?t={bust}"
+    msg = f"WIP preview: {label}"
+    if detail:
+        msg = f"{msg} ({detail})"
+    _log(job_id, msg, progress, stage, with_vram=True)
+    with _jobs_lock:
+        job = _jobs.setdefault(
+            job_id,
+            {
+                "id": job_id,
+                "status": "queued",
+                "progress": 0,
+                "stage": "queued",
+                "logs": [],
+                "glb_url": None,
+                "preview_url": None,
+                "preview_label": None,
+                "preview_history": [],
+                "error": None,
+            },
+        )
+        history = job.setdefault("preview_history", [])
+        entry = {"url": url, "label": label, "seq": len(history)}
+        history.append(entry)
+        job["preview_url"] = url
+        job["preview_label"] = label
+
+
+def _park_pipeline_on_cpu(pipeline) -> None:
+    """Best-effort: park rembg / cond / flow models on CPU between low-VRAM jobs."""
+    if pipeline is None:
+        return
+    # In standard (non-low-VRAM) mode models stay resident on GPU by design.
+    if not getattr(pipeline, "low_vram", False):
+        try:
+            rembg = getattr(pipeline, "rembg_model", None)
+            if rembg is not None and hasattr(rembg, "cpu"):
+                rembg.cpu()
+        except Exception:
+            pass
+        return
+    try:
+        rembg = getattr(pipeline, "rembg_model", None)
+        if rembg is not None and hasattr(rembg, "cpu"):
+            rembg.cpu()
+    except Exception:
+        pass
+    for attr in (
+        "image_cond_model_ss",
+        "image_cond_model_shape_512",
+        "image_cond_model_shape_1024",
+        "image_cond_model_tex_1024",
+        "image_cond_model",
+    ):
+        try:
+            m = getattr(pipeline, attr, None)
+            if m is not None and hasattr(m, "cpu"):
+                m.cpu()
+        except Exception:
+            pass
+    try:
+        models = getattr(pipeline, "models", None)
+        if isinstance(models, dict):
+            for m in models.values():
+                if m is not None and hasattr(m, "cpu"):
+                    m.cpu()
+    except Exception:
+        pass
+
+
 def _resolve_settings(
     preset: str,
     low_vram: bool,
@@ -227,7 +365,7 @@ def _ensure_pipeline(low_vram: bool):
             except Exception:
                 pass
 
-        from inference import init_pipeline
+        from pipeline_init import init_pipeline
 
         _pipeline = init_pipeline(low_vram=low_vram)
         _pipeline_low_vram = low_vram
@@ -247,6 +385,11 @@ def _run_generation(
     texture_size: int,
     decimation: int,
 ) -> None:
+    mesh_list = None
+    shape_slat = None
+    tex_slat = None
+    mesh = None
+    glb = None
     try:
         import numpy as np
         import torch
@@ -258,7 +401,14 @@ def _run_generation(
             load_moge_model,
         )
 
+        _flush_cuda(job_id, "Pre-run VRAM flush")
         _job_update(job_id, status="running", progress=2, stage="init")
+        try:
+            from pipeline_init import weights_summary
+
+            _log(job_id, f"Weights: {weights_summary()}", 2, "init")
+        except Exception:
+            pass
         _log(
             job_id,
             f"Settings: low_vram={low_vram} res={resolution} steps={steps} "
@@ -272,7 +422,30 @@ def _run_generation(
 
         _log(job_id, f"Preprocessing image: {image_path.name}", 10, "preprocess")
         img = Image.open(image_path)
+        orig_w, orig_h = img.size
+        img = _clamp_input_image(img)
+        clamp_w, clamp_h = img.size
+        if (clamp_w, clamp_h) != (orig_w, orig_h):
+            _log(
+                job_id,
+                f"Input clamped {orig_w}x{orig_h} → {clamp_w}x{clamp_h} "
+                f"(max_pixels={MAX_INPUT_PIXELS}, max_side={MAX_INPUT_SIDE})",
+            )
+        else:
+            _log(job_id, f"Input size {orig_w}x{orig_h} (within clamp)")
+
+        # Persist clamped original so rembg/MoGe never see the huge upload
+        clamped_path = output_path.parent / f"input_clamped_{job_id[:8]}.png"
+        img.save(clamped_path)
+
         image_preprocessed = pipeline.preprocess_image(img)
+        # rembg may have been on GPU even outside low_vram; park it
+        try:
+            if getattr(pipeline, "rembg_model", None) is not None:
+                pipeline.rembg_model.cpu()
+        except Exception:
+            pass
+        _flush_cuda(job_id, "Post-preprocess flush")
 
         tmp_path = output_path.parent / f"_tmp_preprocessed_{job_id[:8]}.png"
         image_preprocessed.save(tmp_path)
@@ -323,7 +496,7 @@ def _run_generation(
             )
             moge_model.cpu()
             del moge_model
-            torch.cuda.empty_cache()
+            _flush_cuda(job_id, "Post-MoGe flush")
 
         try:
             tmp_path.unlink(missing_ok=True)
@@ -334,12 +507,15 @@ def _run_generation(
         pipeline_type = f"{res}_cascade"
         _log(
             job_id,
-            f"Running 3D pipeline ({pipeline_type})...",
+            f"Running staged 3D pipeline ({pipeline_type})...",
             30,
             "generate",
             with_vram=True,
         )
         torch.manual_seed(seed)
+
+        from preview_export import coords_to_voxel_glb, points_to_rainbow_glb
+        from pixal3d.modules.sparse import SparseTensor
 
         ss_sampler_override = {
             "steps": steps,
@@ -360,34 +536,261 @@ def _run_generation(
             "rescale_t": 3.0,
         }
 
+        job_dir = output_path.parent
+        job_dir.mkdir(parents=True, exist_ok=True)
+        camera_angle_x = camera_params["camera_angle_x"]
+        distance = camera_params["distance"]
+        mesh_scale = camera_params.get("mesh_scale", 1.0)
+        hr_resolution = res
+        image = image_preprocessed
+
+        # ---- Stage 1: Sparse structure ----
+        _log(job_id, "Stage: sparse structure…", 35, "sparse", with_vram=True)
+        cond_ss = pipeline.get_proj_cond_ss(
+            [image],
+            camera_angle_x=camera_angle_x,
+            distance=distance,
+            mesh_scale=mesh_scale,
+        )
+        ss_res = 32
+        coords = pipeline.sample_sparse_structure(
+            cond_ss, ss_res, 1, ss_sampler_override
+        )
+        del cond_ss
+        try:
+            preview_ss = job_dir / "preview_ss.glb"
+            info = coords_to_voxel_glb(coords, preview_ss, grid_resolution=ss_res)
+            _emit_wip_preview(
+                job_id,
+                preview_ss,
+                "Sparse voxels",
+                progress=42,
+                stage="sparse",
+                detail=f"{info.get('voxels', 0):,} voxels",
+            )
+        except Exception as preview_err:
+            _log(job_id, f"WIP sparse preview skipped: {preview_err}")
+        _flush_cuda(job_id, "Post-sparse flush")
+
+        # ---- Stage 2: Shape LR 512 ----
+        _log(job_id, "Stage: shape LR (512)…", 48, "shape_lr", with_vram=True)
+        cond_shape_lr = pipeline.get_proj_cond_shape(
+            pipeline.image_cond_model_shape_512,
+            [image],
+            coords,
+            camera_angle_x=camera_angle_x,
+            distance=distance,
+            mesh_scale=mesh_scale,
+        )
+        lr_slat = pipeline.sample_shape_slat(
+            cond_shape_lr,
+            pipeline.models["shape_slat_flow_model_512"],
+            coords,
+            shape_sampler_override,
+        )
+        del cond_shape_lr, coords
+        _flush_cuda(job_id, "Post-shape-LR flush")
+
+        # ---- Stage 3a: Upsample → denser voxels ----
+        _log(job_id, "Stage: upsample occupancy…", 55, "upsample", with_vram=True)
+        if pipeline.low_vram:
+            pipeline.models["shape_slat_decoder"].to(pipeline.device)
+            pipeline.models["shape_slat_decoder"].low_vram = True
+        hr_coords = pipeline.models["shape_slat_decoder"].upsample(lr_slat, upsample_times=4)
+        if pipeline.low_vram:
+            pipeline.models["shape_slat_decoder"].cpu()
+            pipeline.models["shape_slat_decoder"].low_vram = False
+
+        lr_resolution = 512
+        actual_hr_resolution = hr_resolution
+        while True:
+            grid_res_tok = actual_hr_resolution // 16
+            quant_coords = torch.cat(
+                [
+                    hr_coords[:, :1],
+                    ((hr_coords[:, 1:] + 0.5) / lr_resolution * (grid_res_tok - 1))
+                    .round()
+                    .int(),
+                ],
+                dim=1,
+            )
+            hr_coords_unique = quant_coords.unique(dim=0)
+            num_tokens = hr_coords_unique.shape[0]
+            if num_tokens < max_tokens or actual_hr_resolution == 1024:
+                if actual_hr_resolution != hr_resolution:
+                    _log(
+                        job_id,
+                        f"Token cap: resolution reduced to {actual_hr_resolution}",
+                    )
+                break
+            actual_hr_resolution -= 128
+
+        actual_grid_res = actual_hr_resolution // 16
+        # Park upsample leftovers before CPU voxel export (avoids ~10G reserved spike)
+        del lr_slat, hr_coords, quant_coords
+        _flush_cuda(job_id, "Post-upsample flush")
+        try:
+            preview_up = job_dir / "preview_up.glb"
+            info = coords_to_voxel_glb(
+                hr_coords_unique,
+                preview_up,
+                grid_resolution=actual_grid_res,
+                color=(0.45, 0.82, 0.72, 1.0),
+            )
+            _emit_wip_preview(
+                job_id,
+                preview_up,
+                "Dense voxels",
+                progress=60,
+                stage="upsample",
+                detail=f"{info.get('voxels', 0):,} / {info.get('total', 0):,} voxels",
+            )
+        except Exception as preview_err:
+            _log(job_id, f"WIP dense preview skipped: {preview_err}")
+
+        # ---- Stage 3b: Shape HR ----
         _log(
             job_id,
-            "Stage: sparse structure → shape → texture...",
-            40,
-            "generate",
+            f"Stage: shape HR ({actual_hr_resolution})…",
+            65,
+            "shape_hr",
             with_vram=True,
         )
-        mesh_list, (shape_slat, tex_slat, grid_res) = pipeline.run(
-            image_preprocessed,
-            camera_params=camera_params,
-            seed=seed,
-            sparse_structure_sampler_params=ss_sampler_override,
-            shape_slat_sampler_params=shape_sampler_override,
-            tex_slat_sampler_params=tex_sampler_override,
-            preprocess_image=False,
-            return_latent=True,
-            pipeline_type=pipeline_type,
-            max_num_tokens=max_tokens,
+        cond_shape_hr = pipeline.get_proj_cond_shape(
+            pipeline.image_cond_model_shape_1024,
+            [image],
+            hr_coords_unique,
+            camera_angle_x=camera_angle_x,
+            distance=distance,
+            mesh_scale=mesh_scale,
+            grid_resolution_override=actual_grid_res,
         )
+        noise_hr = SparseTensor(
+            feats=torch.randn(
+                hr_coords_unique.shape[0],
+                pipeline.models["shape_slat_flow_model_1024"].in_channels,
+            ).to(pipeline.device),
+            coords=hr_coords_unique,
+        )
+        sampler_params_hr = {
+            **pipeline.shape_slat_sampler_params,
+            **shape_sampler_override,
+        }
+        flow_model_hr = pipeline.models["shape_slat_flow_model_1024"]
+        if pipeline.low_vram:
+            flow_model_hr.to(pipeline.device)
+        hr_slat = pipeline.shape_slat_sampler.sample(
+            flow_model_hr,
+            noise_hr,
+            **cond_shape_hr,
+            **sampler_params_hr,
+            verbose=True,
+            tqdm_desc=f"Sampling HR shape SLat (proj, {actual_hr_resolution})",
+        ).samples
+        if pipeline.low_vram:
+            flow_model_hr.cpu()
+        std = torch.tensor(pipeline.shape_slat_normalization["std"])[None].to(
+            hr_slat.device
+        )
+        mean = torch.tensor(pipeline.shape_slat_normalization["mean"])[None].to(
+            hr_slat.device
+        )
+        shape_slat = hr_slat * std + mean
+        del cond_shape_hr, noise_hr, hr_slat, hr_coords_unique
+        _flush_cuda(job_id, "Post-shape-HR flush")
+
+        # Cheap 3rd WIP: HR occupancy voxels (no extra shape decode — avoids 24GB spike)
+        try:
+            preview_shape = job_dir / "preview_shape.glb"
+            info = coords_to_voxel_glb(
+                shape_slat.coords,
+                preview_shape,
+                grid_resolution=actual_grid_res,
+                color=(0.78, 0.78, 0.82, 1.0),
+            )
+            _emit_wip_preview(
+                job_id,
+                preview_shape,
+                "Shape occupancy",
+                progress=72,
+                stage="shape_hr",
+                detail=f"{info.get('voxels', 0):,} voxels",
+            )
+        except Exception as preview_err:
+            _log(job_id, f"WIP shape occupancy preview skipped: {preview_err}")
+
+        # ---- Stage 4: Texture ----
+        _log(job_id, "Stage: texture…", 78, "texture", with_vram=True)
+        tex_grid_res = actual_hr_resolution // 16
+        cond_tex = pipeline.get_proj_cond_shape(
+            pipeline.image_cond_model_tex_1024,
+            [image],
+            shape_slat.coords,
+            camera_angle_x=camera_angle_x,
+            distance=distance,
+            mesh_scale=mesh_scale,
+            grid_resolution_override=tex_grid_res,
+        )
+        tex_slat = pipeline.sample_tex_slat(
+            cond_tex,
+            pipeline.models["tex_slat_flow_model_1024"],
+            shape_slat,
+            tex_sampler_override,
+        )
+        del cond_tex
+        _flush_cuda(job_id, "Post-texture flush")
+
+        # ---- Stage 5: Decode (use pipeline.decode_latent for @torch.no_grad) ----
+        _log(job_id, "Stage: decode latent…", 85, "decode", with_vram=True)
+        grid_res = actual_hr_resolution
+        with torch.no_grad():
+            mesh_list = pipeline.decode_latent(shape_slat, tex_slat, grid_res)
         mesh = mesh_list[0]
-        torch.cuda.empty_cache()
-        _log(job_id, "Pipeline finished. Extracting GLB...", 85, "export", with_vram=True)
+        # Clay WIP: rainbow point cloud from decode verts (mesh preview was unreliable)
+        try:
+            n_verts = int(mesh.vertices.shape[0]) if hasattr(mesh.vertices, "shape") else -1
+            _log(
+                job_id,
+                f"Exporting clay point cloud ({n_verts:,} verts → capped)…",
+                86,
+                "clay",
+                with_vram=True,
+            )
+            preview_clay = job_dir / "preview_clay.glb"
+            info = points_to_rainbow_glb(
+                mesh.vertices.detach() if hasattr(mesh.vertices, "detach") else mesh.vertices,
+                preview_clay,
+            )
+            detail = f"{info.get('points', 0):,} pts"
+            if info.get("total") and info["total"] != info.get("points"):
+                detail = f"{info['points']:,} of {info['total']:,} pts"
+            _emit_wip_preview(
+                job_id,
+                preview_clay,
+                "Clay points",
+                progress=87,
+                stage="clay",
+                detail=detail,
+            )
+        except Exception as clay_err:
+            _log(job_id, f"WIP clay export skipped: {clay_err}")
+        del shape_slat, tex_slat
+        shape_slat = None
+        tex_slat = None
+        _flush_cuda(job_id, "Post-pipeline flush")
+        _log(job_id, "Pipeline finished. Extracting GLB...", 88, "export", with_vram=True)
+
+        # Detach before o_voxel — requires_grad tensors break .numpy()
+        verts = mesh.vertices.detach() if hasattr(mesh.vertices, "detach") else mesh.vertices
+        faces = mesh.faces.detach() if hasattr(mesh.faces, "detach") else mesh.faces
+        attrs = mesh.attrs.detach() if hasattr(mesh.attrs, "detach") else mesh.attrs
+        coords = mesh.coords.detach() if hasattr(mesh.coords, "detach") else mesh.coords
 
         glb = o_voxel.postprocess.to_glb(
-            vertices=mesh.vertices,
-            faces=mesh.faces,
-            attr_volume=mesh.attrs,
-            coords=mesh.coords,
+            vertices=verts,
+            faces=faces,
+            attr_volume=attrs,
+            coords=coords,
             attr_layout=pipeline.pbr_attr_layout,
             grid_size=grid_res,
             aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
@@ -399,6 +802,7 @@ def _run_generation(
             use_tqdm=True,
         )
 
+        # Match model-viewer: PREVIEW_ROT then 180° Y (front-facing; up already correct)
         rot = np.array(
             [
                 [-1, 0, 0, 0],
@@ -408,28 +812,58 @@ def _run_generation(
             ],
             dtype=np.float64,
         )
+        yaw = np.array(
+            [
+                [-1, 0, 0, 0],
+                [0, 1, 0, 0],
+                [0, 0, -1, 0],
+                [0, 0, 0, 1],
+            ],
+            dtype=np.float64,
+        )
         glb.apply_transform(rot)
+        glb.apply_transform(yaw)
 
         output_path.parent.mkdir(parents=True, exist_ok=True)
         glb.export(str(output_path), extension_webp=True)
-        torch.cuda.empty_cache()
+
+        del mesh, mesh_list, glb
+        mesh = None
+        mesh_list = None
+        glb = None
+        _park_pipeline_on_cpu(pipeline)
+        _flush_cuda(job_id, "Post-export VRAM flush")
 
         rel = output_path.relative_to(OUTPUTS).as_posix()
         glb_url = f"/outputs/{rel}"
         _log(job_id, f"Done. GLB saved: {output_path.name}", 100, "done", with_vram=True)
-        _job_update(job_id, status="done", progress=100, stage="done", glb_url=glb_url)
+        _job_update(
+            job_id,
+            status="done",
+            progress=100,
+            stage="done",
+            glb_url=glb_url,
+            preview_url=glb_url,
+            preview_label="Final",
+        )
 
     except Exception as e:
         tb = traceback.format_exc()
         _log(job_id, f"ERROR: {e}")
         _log(job_id, tb)
         _job_update(job_id, status="error", stage="error", error=str(e))
+    finally:
+        # Always drop large refs + flush so repeated runs don't climb reserved VRAM
+        mesh_list = None
+        shape_slat = None
+        tex_slat = None
+        mesh = None
+        glb = None
         try:
-            import torch
-
-            torch.cuda.empty_cache()
+            _park_pipeline_on_cpu(_pipeline)
         except Exception:
             pass
+        _flush_cuda(job_id, "Between-run VRAM flush")
 
 
 # ---------------------------------------------------------------------------
@@ -583,6 +1017,9 @@ async def job_events(job_id: str):
                     "stage": job["stage"],
                     "logs": logs,
                     "glb_url": job.get("glb_url"),
+                    "preview_url": job.get("preview_url"),
+                    "preview_label": job.get("preview_label"),
+                    "preview_history": list(job.get("preview_history") or []),
                     "error": job.get("error"),
                     "vram": _vram_snapshot(),
                 }
@@ -595,7 +1032,19 @@ async def job_events(job_id: str):
 
 
 def main():
+    import logging
+
     import uvicorn
+
+    class _QuietVramAccessFilter(logging.Filter):
+        def filter(self, record: logging.LogRecord) -> bool:
+            try:
+                msg = record.getMessage()
+            except Exception:
+                return True
+            return "GET /api/vram" not in msg
+
+    logging.getLogger("uvicorn.access").addFilter(_QuietVramAccessFilter())
 
     host = os.environ.get("PIXAL3D_HOST", "127.0.0.1")
     port = int(os.environ.get("PIXAL3D_PORT", "7860"))
@@ -603,6 +1052,13 @@ def main():
     print(f"ATTN_BACKEND={os.environ.get('ATTN_BACKEND')}")
     print(f"DEFAULT_PRESET={DEFAULT_PRESET}")
     print(f"PYTORCH_CUDA_ALLOC_CONF={os.environ.get('PYTORCH_CUDA_ALLOC_CONF')}")
+    use_gguf = os.environ.get("PIXAL3D_USE_GGUF", "1").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+    print(f"PIXAL3D_USE_GGUF={int(use_gguf)} QUANT={os.environ.get('PIXAL3D_GGUF_QUANT', 'Q5_K_M')}")
     uvicorn.run(app, host=host, port=port, log_level="info")
 
 
